@@ -6,16 +6,20 @@
 // Reads ./config.json (expects { "destination": "http://host:port/upload" }) unless --url is provided.
 // Uploads the file as a binary stream via Axios POST, attaching ?fileName=<basename> to the URL.
 // Shows a live progress bar with percent, MiB progress, speed (Mb/s + MiB/s), and smooth ETA.
+//
+// Mintty/MSYS2 notes:
+// - If the status line wraps, \r only returns to the last wrapped line, causing "new lines" each tick.
+// - This version dynamically fits to terminal width and (optionally) disables auto-wrap while rendering.
 
 import fs from "fs";
 import path from "path";
 import { Transform } from "stream";
 import axios from "axios";
-import readline from "readline";
 
-const BAR_WIDTH = 30;          // <-- adjust bar width here
+const BAR_WIDTH = 30;          // <-- max bar width (will shrink to fit terminal)
 const TICK_MS = 100;           // UI refresh interval
 const SPEED_ALPHA = 0.2;       // EMA smoothing factor (0..1). Higher = more responsive, more jitter.
+const DISABLE_AUTOWRAP = true; // <-- helps a lot on terminals that support it (mintty does)
 
 function printUsageAndExit(code = 1) {
   console.error(
@@ -78,7 +82,6 @@ function buildUploadUrl(baseUrl, fileName) {
   } catch {
     throw new Error(`Invalid destination URL: ${baseUrl}`);
   }
-  // Attach/overwrite fileName query param
   u.searchParams.set("fileName", fileName);
   return u.toString();
 }
@@ -102,12 +105,55 @@ function makeBar(progress01, width) {
   const filled = Math.round(clamped * width);
   const empty = width - filled;
 
-  // Feel free to swap these for pure ASCII: "#" and "-"
+  // If you want pure ASCII (safer for some fonts), swap these:
+  // const filledChar = "#"; const emptyChar = "-";
   const filledChar = "█";
   const emptyChar = "░";
 
   return `[${filledChar.repeat(filled)}${emptyChar.repeat(empty)}]`;
 }
+
+// -------- Mintty-safe single-line renderer --------
+let lastRenderedLen = 0;
+
+function enableNoWrap() {
+  if (!process.stdout.isTTY) return;
+  if (!DISABLE_AUTOWRAP) return;
+  // ESC[?7l disables line wrap (DECAWM). ESC[?7h re-enables.
+  process.stdout.write("\x1b[?7l");
+}
+
+function restoreWrap() {
+  if (!process.stdout.isTTY) return;
+  if (!DISABLE_AUTOWRAP) return;
+  process.stdout.write("\x1b[?7h");
+}
+
+function writeStatusLine(line) {
+  if (!process.stdout.isTTY) {
+    // Non-TTY: don't attempt in-place updates.
+    console.log(line);
+    return;
+  }
+
+  const cols = process.stdout.columns || 0;
+
+  // Truncate to terminal width to avoid wrapping (the main cause of the mintty behavior)
+  let out = line;
+  if (cols > 0 && out.length > cols - 1) {
+    out = out.slice(0, cols - 1);
+  }
+
+  // Clear line + return carriage, then write.
+  // \x1b[2K clears the entire current line (xterm-compatible).
+  // Pad to fully overwrite remnants from a longer previous render.
+  const padLen = Math.max(0, lastRenderedLen - out.length);
+  const padded = out + " ".repeat(padLen);
+
+  process.stdout.write("\r\x1b[2K" + padded);
+  lastRenderedLen = out.length;
+}
+// -----------------------------------------------
 
 async function main() {
   const { file, url: urlOverride } = parseArgs(process.argv);
@@ -156,7 +202,6 @@ async function main() {
 
   const readStream = fs.createReadStream(filePath);
 
-  // Track bytes that pass through the outgoing stream.
   let uploadedBytes = 0;
 
   const counter = new Transform({
@@ -166,13 +211,15 @@ async function main() {
     },
   });
 
-  // Smoothed speed estimate (bytes/sec) + ETA
+  // Smoothed speed estimate (bytes/sec)
   let lastBytes = 0;
   let lastTime = Date.now();
   let emaBytesPerSec = 0;
 
-  // Live UI ticker
   const startTime = Date.now();
+
+  enableNoWrap();
+
   const ticker = setInterval(() => {
     const now = Date.now();
     const dt = (now - lastTime) / 1000;
@@ -200,42 +247,43 @@ async function main() {
     const remainingBytes = Math.max(0, totalBytes - uploadedBytes);
     const etaSec = emaBytesPerSec > 1 ? remainingBytes / emaBytesPerSec : Infinity;
 
-    const bar = makeBar(progress01, BAR_WIDTH);
+    const suffix =
+      `[${percent}%] ` +
+      `[${mibDone} MiB/${mibTotal} MiB] ` +
+      `[Upload: ${mbps.toFixed(2)} Mb/s = ${mibPerSec.toFixed(2)} MiB/s] ` +
+      `[Estimated completion ${formatHMS(etaSec)}]`;
 
-    // Draw one-line progress
-    readline.clearLine(process.stdout, 0);
-    readline.cursorTo(process.stdout, 0);
+    // Dynamically shrink bar to prevent wrapping
+    const cols = process.stdout.isTTY ? (process.stdout.columns || 0) : 0;
+    let barWidth = BAR_WIDTH;
 
-    process.stdout.write(
-      `${bar} ` +
-        `[${percent}%] ` +
-        `[${mibDone} MiB/${mibTotal} MiB] ` +
-        `[Upload: ${mbps.toFixed(2)} Mb/s = ${mibPerSec.toFixed(2)} MiB/s] ` +
-        `[Estimated completion ${formatHMS(etaSec)}]`
-    );
+    if (cols > 0) {
+      // total line length = bar(2 + barWidth) + space(1) + suffix.length
+      const maxBarWidth = cols - suffix.length - 3;
+      barWidth = Math.max(5, Math.min(BAR_WIDTH, maxBarWidth));
+    }
+
+    const bar = makeBar(progress01, barWidth);
+    writeStatusLine(`${bar} ${suffix}`);
   }, TICK_MS);
 
-  // Pipe the file through our counter (so we can measure progress)
   const bodyStream = readStream.pipe(counter);
 
   try {
     await axios.post(uploadUrl, bodyStream, {
       headers: {
         "Content-Length": totalBytes,
-        // Optional: you can set a content-type, but server-side we’re treating it as raw bytes anyway
         "Content-Type": "application/octet-stream",
       },
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
-      // timeout: 0, // uncomment for no timeout (Axios default is 0 in Node, but depends on version/config)
-      validateStatus: (status) => status >= 200 && status < 300, // treat non-2xx as error
+      validateStatus: (status) => status >= 200 && status < 300,
     });
 
-    // Ensure final 100% render
     uploadedBytes = totalBytes;
   } catch (e) {
     clearInterval(ticker);
-    // Move to a clean line before printing error
+    restoreWrap();
     process.stdout.write("\n");
 
     if (e.response) {
@@ -249,15 +297,18 @@ async function main() {
     process.exit(1);
   } finally {
     clearInterval(ticker);
+    restoreWrap();
   }
 
-  // Final newline + summary
   const elapsedSec = (Date.now() - startTime) / 1000;
   process.stdout.write("\n");
-  console.log(`Done. Uploaded "${fileName}" (${(totalBytes / (1024 * 1024)).toFixed(2)} MiB) in ${elapsedSec.toFixed(2)}s`);
+  console.log(
+    `Done. Uploaded "${fileName}" (${(totalBytes / (1024 * 1024)).toFixed(2)} MiB) in ${elapsedSec.toFixed(2)}s`
+  );
 }
 
 main().catch((e) => {
+  restoreWrap();
   console.error(`Fatal error: ${e?.message ?? e}`);
   process.exit(1);
 });
